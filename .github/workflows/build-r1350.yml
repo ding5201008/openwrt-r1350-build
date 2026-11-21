@@ -1,4 +1,4 @@
-name: Build OpenWrt for Xiaomi R1350 (Mi Router 4 Pro) + OpenClash
+name: Build OpenWrt for Xiaomi R1350 (Mi Router 4 Pro) + OpenClash IPK
 
 # 手动触发：进入 Actions 页面，选择本工作流，点 "Run workflow"
 on:
@@ -11,7 +11,7 @@ permissions:
 
 jobs:
   build:
-    name: Build R1350 firmware with OpenClash
+    name: Build lean R1350 firmware + standalone OpenClash IPK
     runs-on: ubuntu-22.04      # OpenWrt 24.10 在 22.04 上验证过（python3-distutils 仍可用）
     timeout-minutes: 300
 
@@ -52,7 +52,7 @@ jobs:
           ref: main
           path: r1350-port
 
-      # 缓存下载目录，重跑时省去重复下载（key 绑定固定 commit + OpenClash 分支 tag）
+      # 缓存下载目录，重跑时省去重复下载
       - name: Cache OpenWrt downloads
         uses: actions/cache@v4
         with:
@@ -69,7 +69,7 @@ jobs:
           git checkout "$OPENWRT_COMMIT"
           git rev-parse HEAD
 
-      # 把 OpenClash 注册为第三方 feed（标准做法：追加到 feeds.conf.default）
+      # 把 OpenClash 注册为第三方 feed（这样才能单独编译它的 ipk）
       - name: Add OpenClash feed
         working-directory: openwrt
         run: |
@@ -89,37 +89,47 @@ jobs:
              target/linux/ath79/generic/base-files/etc/uci-defaults/
           echo "DTS copied + patch 0002 applied"
 
-      - name: Feeds and prepare .config with OpenClash
+      # 关键策略：固件保持精简（约 7-8 MB，稳进 14MB 分区），
+      # OpenClash 及 ruby 大依赖用 =m 只编译成 ipk、不进固件，刷机后再安装。
+      - name: Feeds and prepare .config (lean firmware + OpenClash as IPK)
         working-directory: openwrt
         run: |
           ./scripts/feeds update -a
           ./scripts/feeds install -a
-          # 基于原作者的 config.seed，做最小改动以加入 OpenClash
           cp ../r1350-port/patches/config.seed .config
-          # 1) dnsmasq -> dnsmasq-full（OpenClash 硬依赖；原 seed 里是 dnsmasq=y）
+
+          # ---- 固件部分：仅加入 OpenClash 运行所需的小依赖 ----
+          # 1) dnsmasq -> dnsmasq-full（OpenClash 依赖；体积增加很小）
           sed -i 's/^CONFIG_PACKAGE_dnsmasq=y$/# CONFIG_PACKAGE_dnsmasq is not set/' .config
           sed -i '/^# CONFIG_PACKAGE_dnsmasq-full is not set$/c\CONFIG_PACKAGE_dnsmasq-full=y' .config
           grep -q '^CONFIG_PACKAGE_dnsmasq-full=y' .config || echo 'CONFIG_PACKAGE_dnsmasq-full=y' >> .config
-          # 2) 打开 OpenClash 及其依赖（Kconfig 会自动选中 nft-tproxy/ruby-yaml 等）
-          echo 'CONFIG_PACKAGE_luci-app-openclash=y' >> .config
-          echo 'CONFIG_PACKAGE_luci-i18n-openclash-zh-cn=y' >> .config
-          echo 'CONFIG_PACKAGE_kmod-inet-diag=y' >> .config
-          echo 'CONFIG_PACKAGE_luci-compat=y' >> .config
-          # firewall4 环境需要 nftables 透明代理模块；先清掉 seed 里的 "not set" 再打开
+          # 2) firewall4 透明代理所需的小模块（进固件，避免装 ipk 时再拉 kmod）
           sed -i '/^# CONFIG_PACKAGE_kmod-nft-tproxy is not set$/d' .config
-          echo 'CONFIG_PACKAGE_kmod-nft-tproxy=y' >> .config
+          grep -q '^CONFIG_PACKAGE_kmod-nft-tproxy=y' .config || echo 'CONFIG_PACKAGE_kmod-nft-tproxy=y' >> .config
+          sed -i '/^# CONFIG_PACKAGE_kmod-inet-diag is not set$/d' .config
+          grep -q '^CONFIG_PACKAGE_kmod-inet-diag=y' .config || echo 'CONFIG_PACKAGE_kmod-inet-diag=y' >> .config
+          grep -q '^CONFIG_PACKAGE_luci-compat=y' .config || echo 'CONFIG_PACKAGE_luci-compat=y' >> .config
+
+          # ---- OpenClash 部分：=m 表示只生成 ipk、不打包进固件 ----
+          # ruby / ruby-yaml / bash / curl 等依赖会由 Kconfig 自动变成 =m
+          echo 'CONFIG_PACKAGE_luci-app-openclash=m' >> .config
+          echo 'CONFIG_PACKAGE_luci-i18n-openclash-zh-cn=m' >> .config
+
           make defconfig
           echo "===== key config check ====="
           grep -E '^CONFIG_TARGET_(ARCH|SUBTARGET|BOARD)=' .config
-          grep -E '^CONFIG_PACKAGE_(luci-app-openclash|dnsmasq-full|kmod-nft-tproxy)=' .config
+          grep -E '^CONFIG_PACKAGE_(luci-app-openclash|dnsmasq-full|kmod-nft-tproxy)=' .config || true
           grep -E '^CONFIG_TARGET_ath79_generic_DEVICE_.*=y' .config
+          echo "===== module packages (built as ipk, NOT in firmware) ====="
+          grep -E '^CONFIG_PACKAGE_.*=m$' .config | head -50
 
       - name: Download source packages
         working-directory: openwrt
         run: |
           make -j"$(nproc)" download || make -j1 download V=s
 
-      - name: Build firmware
+      # 一次编译同时产出：精简 sysupgrade 固件 + OpenClash 及其依赖 ipk
+      - name: Build firmware and OpenClash ipk
         working-directory: openwrt
         run: |
           make -j"$(nproc)" || make -j1 V=s
@@ -136,25 +146,54 @@ jobs:
           ACTUAL=$(stat -c%s "$IMG")
           echo "firmware size: $ACTUAL bytes; partition max: $FW_PART_MAX bytes"
           if [ "$ACTUAL" -gt "$FW_PART_MAX" ]; then
-            echo "::error::Firmware ($ACTUAL B) exceeds 14 MiB firmware partition. OpenClash + ruby deps too big. Remove some packages or flash an extroot setup."
+            echo "::error::Firmware ($ACTUAL B) exceeds 14 MiB firmware partition."
             exit 1
           fi
-          echo "OK: firmware fits in partition."
+          echo "OK: firmware fits in partition ($(( FW_PART_MAX - ACTUAL )) bytes headroom)."
 
-      - name: Collect firmware
+      - name: Collect firmware and OpenClash ipk bundle
         run: |
-          mkdir -p artifacts
+          mkdir -p artifacts ipk-bundle
+          # 1) 固件（sysupgrade / initramfs / factory 等）
           cp -v openwrt/bin/targets/ath79/generic/${TARGET_NAME}-* artifacts/ 2>/dev/null || true
-          # 单独编译出的 OpenClash ipk 也一并收集，方便后续 extroot/opkg 安装
-          find openwrt/bin/packages -name 'luci-app-openclash_*.ipk' -exec cp -v {} artifacts/ \; 2>/dev/null || true
+
+          # 2) OpenClash 及其依赖 ipk（=m 编译出来的）
+          find openwrt/bin/packages -type f \( \
+              -name 'luci-app-openclash*.ipk' -o \
+              -name 'luci-i18n-openclash*.ipk' -o \
+              -name 'ruby*.ipk' -o -name 'libruby*.ipk' -o \
+              -name 'bash*.ipk' -o -name 'libreadline*.ipk' -o \
+              -name 'curl*.ipk' -o -name 'libcurl*.ipk' -o \
+              -name 'ip-full*.ipk' -o -name 'unzip*.ipk' -o \
+              -name 'libbsd*.ipk' -o -name 'ca-bundle*.ipk' -o \
+              -name 'kmod-tun*.ipk' \
+            \) -exec cp -v {} ipk-bundle/ \; 2>/dev/null || true
+
+          # 3) 一键安装脚本（刷机后在路由器上执行）
+          cat > ipk-bundle/install.sh <<'EOF'
+          #!/bin/sh
+          # 用法：把本目录传到路由器的 /tmp/openclash-ipk，然后执行 sh install.sh
+          cd "$(dirname "$0")" || exit 1
+          echo "==> opkg update"
+          opkg update
+          echo "==> installing OpenClash and dependencies"
+          opkg install ./*.ipk
+          echo "==> done. Reboot, then LuCI -> Services -> OpenClash"
+          EOF
+          chmod +x ipk-bundle/install.sh
+          tar czf artifacts/openclash-ipk-bundle.tar.gz -C ipk-bundle .
+
           echo "===== artifacts ====="
           ls -lh artifacts/
-          test -n "$(ls -A artifacts/)" || { echo "No firmware produced!"; exit 1; }
+          echo "===== ipk bundle contents ====="
+          ls -lh ipk-bundle/
+          test -f "artifacts/${TARGET_NAME}-squashfs-sysupgrade.bin" || { echo "No sysupgrade firmware produced!"; exit 1; }
+          test -s artifacts/openclash-ipk-bundle.tar.gz || { echo "No OpenClash ipk bundle produced!"; exit 1; }
 
       - name: Upload firmware as artifact
         uses: actions/upload-artifact@v4
         with:
-          name: openwrt-r1350-openclash-firmware
+          name: openwrt-r1350-firmware-plus-openclash-ipk
           path: artifacts/*
           if-no-files-found: error
           retention-days: 30
@@ -170,7 +209,12 @@ jobs:
           if gh release view "$TAG" >/dev/null 2>&1; then
             gh release upload "$TAG" artifacts/* --clobber
           else
+            NOTES="Auto-built from nyarime/openwrt-r1350 + vernesong/OpenClash. "
+            NOTES="$NOTES FIRMWARE: flash *-squashfs-sysupgrade.bin (~7-8 MB, fits 14 MB partition). "
+            NOTES="$NOTES OPENCLASH: NOT inside firmware (ruby deps too big for 16 MB flash). "
+            NOTES="$NOTES Flash firmware first, then extract openclash-ipk-bundle.tar.gz on the router and run install.sh. "
+            NOTES="$NOTES READ the flashing guide before use. Flash at your own risk."
             gh release create "$TAG" artifacts/* \
-              --title "OpenWrt 24.10 for Xiaomi R1350 + OpenClash (build ${GITHUB_RUN_NUMBER})" \
-              --notes "Auto-built from nyarime/openwrt-r1350 + vernesong/OpenClash. Includes luci-app-openclash. SHA256SUMS included. READ the flashing guide before use. Flash at your own risk."
+              --title "OpenWrt 24.10 for Xiaomi R1350 - lean firmware + standalone OpenClash IPK (build ${GITHUB_RUN_NUMBER})" \
+              --notes "$NOTES"
           fi
